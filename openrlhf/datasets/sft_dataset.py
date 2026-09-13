@@ -198,7 +198,10 @@ class SFTDataset(Dataset):
 
     def get_loss_mask(self, input_ids, idx):
         if self.pretrain_mode:
-            return torch.ones_like(input_ids, dtype=torch.float32)  # shape:[1, seq_len]
+            loss_mask = torch.ones_like(input_ids, dtype=torch.float32)
+            # The terminal logit has no next token, even when other samples are longer.
+            loss_mask[:, -1:] = 0
+            return loss_mask
 
         loss_mask = torch.zeros_like(input_ids, dtype=torch.float32)
         if not self.multiturn:
