@@ -102,27 +102,27 @@ class SFTTrainer(ABC):
             self._tensorboard = SummaryWriter(log_dir=log_dir)
 
     def fit(self, args, consumed_samples=0, num_update_steps_per_epoch=None):
+        accumulated_gradient = self.strategy.accumulated_gradient
         # Infer num_update_steps_per_epoch from dataloader if not provided
         if num_update_steps_per_epoch is None:
-            num_update_steps_per_epoch = len(self.train_dataloader)
-        if num_update_steps_per_epoch <= 0:
+            num_update_steps_per_epoch = max(1, len(self.train_dataloader) // accumulated_gradient)
+        if num_update_steps_per_epoch <= 0 or len(self.train_dataloader) * self.epochs < accumulated_gradient:
             raise ValueError(
-                f"num_update_steps_per_epoch must be positive, got {num_update_steps_per_epoch}. "
-                "Check that your dataset is not smaller than train_batch_size."
+                "Training must contain at least one complete gradient-accumulation window "
+                "and num_update_steps_per_epoch must be positive."
             )
 
         # get eval and save steps
         if args.eval.steps == -1:
-            args.eval.steps = num_update_steps_per_epoch  # Evaluate once per epoch
+            args.eval.steps = num_update_steps_per_epoch
         if args.ckpt.save_steps == -1:
             args.ckpt.save_steps = float("inf")  # do not save ckpt
 
-        # Restore step and start_epoch
-        # step is 1-indexed: the logging check (step % accum_grad == 0) fires at multiples of accum_grad,
-        # so +1 ensures we don't re-log the last completed global_step on resume.
-        step = consumed_samples // args.train.batch_size * self.strategy.accumulated_gradient + 1
-        start_epoch = consumed_samples // args.train.batch_size // num_update_steps_per_epoch
-        consumed_samples = consumed_samples % (num_update_steps_per_epoch * args.train.batch_size)
+        # Restore the data position independently of optimizer windows, which may span epochs.
+        samples_per_micro_batch = args.train.batch_size // accumulated_gradient
+        samples_per_epoch = len(self.train_dataloader) * samples_per_micro_batch
+        start_epoch, consumed_in_epoch = divmod(consumed_samples, samples_per_epoch)
+        engine = self.model.model
 
         epoch_bar = tqdm(
             range(start_epoch, self.epochs),
@@ -130,14 +130,16 @@ class SFTTrainer(ABC):
             disable=not self.strategy.is_rank_0(),
         )
         loss_sum = 0
+        window = []
         for epoch in range(start_epoch, self.epochs):
             if isinstance(self.train_dataloader.sampler, DistributedSampler):
                 self.train_dataloader.sampler.set_epoch(
-                    epoch, consumed_samples=0 if epoch > start_epoch else consumed_samples
+                    epoch, consumed_samples=0 if epoch > start_epoch else consumed_in_epoch
                 )
 
+            num_micro_batches = len(self.train_dataloader)
             step_bar = tqdm(
-                range(self.train_dataloader.__len__()),
+                range(num_micro_batches),
                 desc="Train step of epoch %d" % epoch,
                 disable=not self.strategy.is_rank_0(),
             )
@@ -152,57 +154,63 @@ class SFTTrainer(ABC):
             def sft_loss_mask(batch):
                 return batch[2].squeeze(1)[:, :-1]
 
-            for (inputs, attention_masks, loss_masks), loss_batch_info in iter_grad_accum_global_norm(
-                self.train_dataloader, self.strategy, self.strategy.accumulated_gradient, sft_loss_mask
-            ):
-                inputs = inputs.to(device).squeeze(1)
-                attention_mask = attention_masks.to(device).squeeze(1)
-                loss_mask = loss_masks.to(device).squeeze(1)
-                per_token_log_probs, output = self.model(
-                    inputs,
-                    attention_mask=attention_mask,
-                    return_output=True,
-                    return_logprobs=True,
-                    ring_attn_group=self.strategy.ring_attn_group,
-                )
-
-                # mixtral
-                if self.aux_loss:
-                    aux_loss = output.aux_loss
-                else:
-                    aux_loss = 0
-                shifted_loss_mask = loss_mask[:, :-1]
-                gpt_loss = self.loss_fn(
-                    per_token_log_probs,
-                    shifted_loss_mask,
-                    **loss_batch_info,
-                )
-                loss = gpt_loss + aux_loss * self.args.model.aux_loss_coef
-                self.strategy.backward(loss, self.model, self.optimizer)
-                self.strategy.optimizer_step(self.optimizer, self.model, self.scheduler)
-
-                loss_sum += gpt_loss.item()
-                logs_dict = {
-                    "gpt_loss": gpt_loss.item(),
-                    "lr": self.scheduler.get_last_lr()[0],
-                    "grad_norm": self.strategy.get_grad_norm(self.model),
-                }
-                if self.aux_loss:
-                    logs_dict["aux_loss"] = aux_loss.item()
-                # step bar
-                logs_dict = self.strategy.all_reduce(logs_dict)
-                step_bar.set_postfix(logs_dict)
+            # Keep normalization windows aligned with DeepSpeed's fixed-size updates across epochs.
+            # A final incomplete window cannot update the model and is left unused, as before.
+            for batch in self.train_dataloader:
+                window.append(batch)
                 step_bar.update()
+                if len(window) < accumulated_gradient:
+                    continue
 
-                # logs/checkpoints/evaluation
-                if step % self.strategy.accumulated_gradient == 0:
-                    logs_dict["loss_mean"] = loss_sum / self.strategy.accumulated_gradient
-                    loss_sum = 0
-                    global_step = step // self.strategy.accumulated_gradient
-                    client_states = {"consumed_samples": global_step * args.train.batch_size}
-                    self.save_logs_and_checkpoints(args, global_step, step_bar, logs_dict, client_states)
+                for (inputs, attention_masks, loss_masks), loss_batch_info in iter_grad_accum_global_norm(
+                    window, self.strategy, accumulated_gradient, sft_loss_mask
+                ):
+                    inputs = inputs.to(device).squeeze(1)
+                    attention_mask = attention_masks.to(device).squeeze(1)
+                    loss_mask = loss_masks.to(device).squeeze(1)
+                    per_token_log_probs, output = self.model(
+                        inputs,
+                        attention_mask=attention_mask,
+                        return_output=True,
+                        return_logprobs=True,
+                        ring_attn_group=self.strategy.ring_attn_group,
+                    )
 
-                step += 1
+                    # mixtral
+                    if self.aux_loss:
+                        aux_loss = output.aux_loss
+                    else:
+                        aux_loss = 0
+                    shifted_loss_mask = loss_mask[:, :-1]
+                    gpt_loss = self.loss_fn(
+                        per_token_log_probs,
+                        shifted_loss_mask,
+                        **loss_batch_info,
+                    )
+                    loss = gpt_loss + aux_loss * self.args.model.aux_loss_coef
+                    self.strategy.backward(loss, self.model, self.optimizer)
+                    self.strategy.optimizer_step(self.optimizer, self.model, self.scheduler)
+                    consumed_samples += samples_per_micro_batch
+
+                    loss_sum += gpt_loss.item()
+                    logs_dict = {
+                        "gpt_loss": gpt_loss.item(),
+                        "lr": self.scheduler.get_last_lr()[0],
+                        "grad_norm": self.strategy.get_grad_norm(self.model),
+                    }
+                    if self.aux_loss:
+                        logs_dict["aux_loss"] = aux_loss.item()
+                    # step bar
+                    logs_dict = self.strategy.all_reduce(logs_dict)
+                    step_bar.set_postfix(logs_dict)
+
+                # Every emitted window is one complete optimizer update.
+                logs_dict["loss_mean"] = loss_sum / accumulated_gradient
+                loss_sum = 0
+                client_states = {"consumed_samples": consumed_samples}
+                self.save_logs_and_checkpoints(args, engine.global_steps, step_bar, logs_dict, client_states)
+
+                window.clear()
 
             epoch_bar.update()
 
