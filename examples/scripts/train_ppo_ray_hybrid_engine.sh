@@ -41,7 +41,8 @@ python3 -m openrlhf.cli.train_ppo_ray \
    --ds.enable_sleep \
    --train.dynamic_batch_enable \
    --train.max_tokens_per_gpu 16384 \
-   --algo.advantage.is_correction_enable
+   --algo.advantage.is_correction_level token \
+   --algo.advantage.is_correction_mode clip
 
 # Enable tensor parallelism for DeepSpeed
 #    --ds.tensor_parallel_size 2 \

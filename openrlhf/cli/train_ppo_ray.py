@@ -75,7 +75,7 @@ def train(args):
             pg if args.train.colocate_all and not args.train.async_enable else None,
             args.vllm.gpu_memory_utilization,
             args.vllm.enable_sleep,
-            "processed_logprobs" if args.algo.advantage.is_correction_enable else None,
+            "processed_logprobs" if args.algo.advantage.is_correction_level != "off" else None,
             agent_func_path=args.train.agent_func_path,
             remote_rm_url=args.reward.remote_url,
             max_images_per_prompt=getattr(args.data, "max_images_per_prompt", 0),
@@ -253,21 +253,40 @@ if __name__ == "__main__":
         default=0.95,
         help="vLLM gpu_memory_utilization",
     )
+    # Train/rollout (DeepSpeed-actor vs vLLM) logprob-mismatch importance-sampling correction.
     # Your Efficient RL Framework Secretly Brings You Off-Policy RL Training: https://fengyao.notion.site/off-policy-rl
-    parser.add_argument("--algo.advantage.is_correction_enable", action="store_true", default=False)
+    # Named schemes: TIS = token clip, ICEPOP = token mask, seq-mask-tis = seq mask,
+    # FlashREINFORCE trust region = seq mask with binary_kl gating and a single threshold.
+    parser.add_argument(
+        "--algo.advantage.is_correction_level",
+        type=str,
+        default="off",
+        choices=["off", "token", "seq"],
+        help="Granularity of the gated statistic: off (correction disabled), token (each token), seq (per-sequence "
+        "mean: geometric mean of the ratio, mean of a divergence; a rejection filter, mask only).",
+    )
+    parser.add_argument(
+        "--algo.advantage.is_correction_mode",
+        type=str,
+        default="mask",
+        choices=["mask", "clip"],
+        help="Out-of-band treatment: mask drops the unit (zero gradient; survivors keep their per-token IS weight), "
+        "clip clamps the token ratio into [low, high].",
+    )
+    parser.add_argument(
+        "--algo.advantage.is_correction_gating",
+        type=str,
+        default="ratio",
+        choices=["ratio", "binary_kl", "tv"],
+        help="Statistic the gate reads: ratio (the IS weight pi_train/pi_rollout itself) or the sampled-token "
+        "binary_kl / tv divergence between rollout and train policy (a trust region, upper bound only).",
+    )
     parser.add_argument(
         "--algo.advantage.is_correction_threshold",
         type=float,
-        nargs=2,
+        nargs="+",
         default=[0.5, 5.0],
-        help="Low and high thresholds for vllm importance sampling truncation",
-    )
-    parser.add_argument(
-        "--algo.advantage.is_correction_type",
-        type=str,
-        default="tis",
-        choices=["tis", "icepop", "seq-mask-tis"],
-        help="vLLM IS correction type: tis (token-level clamp), icepop (token-level filter), seq-mask-tis (sequence-level geom mean)",
+        help="LOW HIGH bounds on the gated statistic, or a single HIGH for an upper bound only (a trust-region delta).",
     )
 
     # Async training using ray
@@ -419,6 +438,14 @@ if __name__ == "__main__":
     parser.add_argument("--algo.kl.init_coef", type=float, default=0.01, help="KL penalty in PPO")
     parser.add_argument("--actor.policy_loss_type", type=str, default="ppo", choices=["ppo", "gspo"])
     parser.add_argument(
+        "--actor.loss_agg_mode",
+        type=str,
+        default="token-mean",
+        choices=["token-mean", "seq-mean-token-mean"],
+        help="Policy-loss aggregation: token-mean (global token mean) or seq-mean-token-mean (every sequence weighs "
+        "the same).",
+    )
+    parser.add_argument(
         "--algo.kl.estimator",
         type=str,
         default="k1",
@@ -487,9 +514,11 @@ if __name__ == "__main__":
     parser.add_argument(
         "--algo.advantage.estimator",
         type=str,
-        choices=["gae", "reinforce", "rloo", "reinforce_baseline", "group_norm", "dr_grpo"],
+        choices=["gae", "reinforce", "rloo", "reinforce_baseline", "group_norm", "dr_grpo", "flash_reinforce"],
         default="gae",
-        help="Choose advantage estimation method: gae, reinforce, rloo, reinforce_baseline, group_norm, dr_grpo",
+        help="Choose advantage estimation method: gae, reinforce, rloo, reinforce_baseline, group_norm, dr_grpo, "
+        "flash_reinforce (reward minus the rollout-batch mean, no group, no whitening: the n_samples_per_prompt=1 "
+        "estimator; see examples/scripts/train_flash_reinforce_ray_agent_async.sh)",
     )
     parser.add_argument(
         "--algo.kl.use_loss", action="store_true", default=False, help="whether to use KL loss from GRPO"
@@ -606,6 +635,11 @@ if __name__ == "__main__":
 
     if args.train.agent_func_path:
         args.reward.remote_url = "agent"
+
+    threshold = args.algo.advantage.is_correction_threshold
+    if len(threshold) == 1:  # a single value is an upper bound only
+        threshold.insert(0, 0.0)
+    assert len(threshold) == 2, "--algo.advantage.is_correction_threshold takes HIGH or LOW HIGH"
 
     if args.algo.advantage.estimator not in ["gae"]:
         args.critic.model_name_or_path = None

@@ -25,7 +25,9 @@ def maker_module(agent_modules, monkeypatch):
     return module
 
 
-@pytest.mark.parametrize("estimator", ["gae", "reinforce", "group_norm", "rloo", "reinforce_baseline", "dr_grpo"])
+@pytest.mark.parametrize(
+    "estimator", ["gae", "reinforce", "group_norm", "rloo", "reinforce_baseline", "dr_grpo", "flash_reinforce"]
+)
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32, torch.int64])
 def test_reward_shaping_matches_fp32_reference(maker_module, estimator, dtype):
     rewards = torch.tensor([1, 1, 1, 1.0078125] if dtype != torch.int64 else [0, 0, 0, 1], dtype=dtype)
@@ -123,3 +125,25 @@ def test_integer_rewards_preserve_fractional_length_penalty(maker_module):
     torch.testing.assert_close(result.rewards, torch.tensor([0.5, 1.0]))
     torch.testing.assert_close(result.info["reward"], result.rewards)
     torch.testing.assert_close(result.advantages, torch.tensor([[-0.25, -0.25], [0.25, 0.25]]))
+
+
+def test_flash_reinforce_centers_on_the_rollout_batch_mean_without_whitening(maker_module):
+    """The single-rollout estimator: baseline = mean over ALL rollouts (n_samples_per_prompt=1 has no
+    group) and no std normalization, so advantages == returns."""
+    rewards = torch.tensor([1.0, 0.0, 0.0, 0.0])
+    maker = maker_module.RemoteExperienceMaker.__new__(maker_module.RemoteExperienceMaker)
+    maker.advantage_estimator = "flash_reinforce"
+    maker.kl_ctl = SimpleNamespace(value=0.0)
+    maker.strategy = SimpleNamespace(
+        args=SimpleNamespace(
+            rollout=SimpleNamespace(n_samples_per_prompt=1),
+            reward=SimpleNamespace(clip_range=None),
+            algo=SimpleNamespace(advantage=SimpleNamespace(estimator="flash_reinforce", gamma=1.0, no_std_norm=False)),
+        )
+    )
+    experience = Experience(
+        index=list(range(4)), rewards=rewards, action_mask=torch.ones(4, 2), kl=torch.zeros(4, 2), info={}
+    )
+    result = maker.compute_advantages_and_returns([experience])[0]
+    torch.testing.assert_close(result.advantages, torch.tensor([0.75, -0.25, -0.25, -0.25])[:, None].expand(-1, 2))
+    torch.testing.assert_close(result.advantages, result.returns)

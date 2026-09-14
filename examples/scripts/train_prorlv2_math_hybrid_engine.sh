@@ -7,7 +7,7 @@
 # - Clip-Higher (--actor.eps_clip_low_high 0.2 0.27) for exploration
 # - Dynamic Sampling (--dynamic_filtering) to reduce noise
 # - KL-regularized trust regions (--algo.kl.use_loss --algo.kl.estimator k2)
-# - TIS/ICEPOP/MIS (--algo.advantage.is_correction_type) for importance sampling correction
+# - TIS/ICEPOP/MIS (--algo.advantage.is_correction_level / is_correction_mode) for importance sampling correction
 # - Stop Properly Penalty (--stop_properly_penalty_coef) for truncated samples
 #
 # ProRL v2 achieves state-of-the-art performance among 1.5B reasoning models
@@ -73,9 +73,9 @@ python3 -m openrlhf.cli.train_ppo_ray \
    --vllm.enforce_eager \
    --vllm.enable_sleep \
    --ds.enable_sleep \
-   --algo.advantage.is_correction_enable \
+   --algo.advantage.is_correction_level token \
+   --algo.advantage.is_correction_mode mask \
    --algo.advantage.is_correction_threshold 0.5 5.0 \
-   --algo.advantage.is_correction_type icepop \
    --train.max_tokens_per_gpu 32768 \
    --reward.stop_properly_penalty_coef 0.0
 
@@ -85,9 +85,9 @@ python3 -m openrlhf.cli.train_ppo_ray \
 #   --algo.advantage.estimator reinforce_baseline
 #
 # TIS/ICEPOP/MIS (Importance Sampling Correction):
-#   --algo.advantage.is_correction_enable: Enable vLLM importance sampling correction for off-policy rollouts
+#   --algo.advantage.is_correction_level token: Enable token-level vLLM importance sampling correction for off-policy rollouts
 #   --algo.advantage.is_correction_threshold 0.5 5.0: IS truncation interval [low, high]
-#   --algo.advantage.is_correction_type icepop: Set IS coefficients outside [low, high] to 0 (instead of clamp)
+#   --algo.advantage.is_correction_mode mask: Set IS coefficients outside [low, high] to 0 (ICEPOP; clip = TIS clamp)
 #
 # Length Penalty (Two options, can be used together):
 #

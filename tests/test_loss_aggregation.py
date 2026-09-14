@@ -1,8 +1,10 @@
 import importlib.util
+import math
 import sys
 import types
 from pathlib import Path
 
+import pytest
 import torch
 
 _TEST_PACKAGE = "_openrlhf_loss_test"
@@ -131,12 +133,8 @@ def test_policy_kl_metric_uses_policy_ratio_when_vllm_correction_is_enabled():
     advantages = torch.ones_like(log_probs)
     mask = torch.ones_like(log_probs)
 
-    loss_fn = PolicyLoss(
-        enable_vllm_is_correction=True,
-        vllm_is_truncated_threshold=[0.1, 10.0],
-        vllm_is_correction_type="tis",
-    )
-    _, _, ppo_kl, vllm_kl = loss_fn(
+    loss_fn = PolicyLoss(is_correction_level="token", is_correction_mode="clip", is_correction_threshold=[0.1, 10.0])
+    _, _, ppo_kl, vllm_kl, _ = loss_fn(
         log_probs,
         old_log_probs,
         advantages,
@@ -150,11 +148,7 @@ def test_policy_kl_metric_uses_policy_ratio_when_vllm_correction_is_enabled():
 
 def test_icepop_filters_overflowing_ratio_without_nan():
     log_probs = torch.zeros((1, 2), requires_grad=True)
-    loss_fn = PolicyLoss(
-        enable_vllm_is_correction=True,
-        vllm_is_truncated_threshold=[0.5, 5.0],
-        vllm_is_correction_type="icepop",
-    )
+    loss_fn = PolicyLoss(is_correction_level="token", is_correction_mode="mask", is_correction_threshold=[0.5, 5.0])
     loss, *_ = loss_fn(
         log_probs,
         torch.zeros_like(log_probs),
@@ -220,6 +214,78 @@ def test_policy_kl_metric_is_not_clamped():
     advantages = torch.ones_like(log_probs)
     mask = torch.ones_like(log_probs)
 
-    _, _, ppo_kl, _ = PolicyLoss()(log_probs, old_log_probs, advantages, action_mask=mask)
+    _, _, ppo_kl, _, _ = PolicyLoss()(log_probs, old_log_probs, advantages, action_mask=mask)
 
     assert torch.allclose(ppo_kl, (old_log_probs - log_probs).mean())
+
+
+def test_seq_mask_gates_on_the_per_sequence_geometric_mean_ratio():
+    # Row 0: token ratios e^1 and e^-1 (geometric mean 1) -> kept, each token weighted by its own ratio.
+    # Row 1: geometric mean e^2 > 5 -> the whole sequence is dropped.
+    logp = torch.zeros(2, 2)
+    rollout = torch.tensor([[-1.0, 1.0], [-2.0, -2.0]])
+    loss_fn = PolicyLoss(is_correction_level="seq", is_correction_threshold=[0.5, 5.0])
+    loss, _, _, _, filt = loss_fn(
+        logp, logp, torch.ones(2, 2), action_mask=torch.ones(2, 2), rollout_log_probs=rollout
+    )
+    torch.testing.assert_close(loss, -torch.tensor([1.0, -1.0]).exp().sum() / 4)
+    torch.testing.assert_close(filt, torch.tensor(0.5))
+
+
+def test_binary_kl_trust_region_masks_tokens_and_sequences():
+    # On-policy PPO ratio (old == logp) so the surrogate is the REINFORCE gradient. Token 0 is far off
+    # the behavior policy (mu=1/3, pi=1), token 1 matches it (mu=pi=1/2). Token-level binary_kl drops
+    # token 0 and keeps token 1 with IS weight 1: loss = -(0 + 1) / 2. Seq-level (FlashREINFORCE) drops
+    # the whole sequence on its mean KL.
+    logp = torch.tensor([[0.0, math.log(0.5)]])
+    mu = torch.tensor([[-math.log(3.0), math.log(0.5)]])
+    adv, mask = torch.ones(1, 2), torch.ones(1, 2)
+    tok = PolicyLoss(is_correction_level="token", is_correction_gating="binary_kl", is_correction_threshold=[0, 0.05])
+    loss, _, _, _, filt = tok(logp, logp, adv, action_mask=mask, rollout_log_probs=mu)
+    torch.testing.assert_close(loss, torch.tensor(-0.5))
+    torch.testing.assert_close(filt, torch.tensor(0.5))
+    seq = PolicyLoss(is_correction_level="seq", is_correction_gating="binary_kl", is_correction_threshold=[0, 3e-3])
+    loss, _, _, _, filt = seq(logp, logp, adv, action_mask=mask, rollout_log_probs=mu)
+    torch.testing.assert_close(loss, torch.tensor(0.0))
+    torch.testing.assert_close(filt, torch.tensor(1.0))
+    # Two-sided: pi << mu on the sampled token is dropped just the same.
+    _, _, _, _, filt = seq(mu, mu, adv, action_mask=mask, rollout_log_probs=logp)
+    torch.testing.assert_close(filt, torch.tensor(1.0))
+    # A tiny mismatch (pi=0.5 vs mu=0.505, binary KL ~5e-5) stays inside delta=3e-3.
+    close = torch.full((1, 2), math.log(0.5))
+    _, _, _, _, filt = seq(close, close, adv, action_mask=mask, rollout_log_probs=torch.full((1, 2), math.log(0.505)))
+    torch.testing.assert_close(filt, torch.tensor(0.0))
+
+
+def test_tv_trust_region_masks_by_sampled_token_probability_gap():
+    # |pi - mu| on the sampled token: 0.6 vs 0.5 -> 0.1 > 0.05 dropped; 0.52 vs 0.5 kept with IS weight 0.52/0.5.
+    logp = torch.tensor([[math.log(0.6), math.log(0.52)]])
+    mu = torch.full((1, 2), math.log(0.5))
+    loss_fn = PolicyLoss(is_correction_level="token", is_correction_gating="tv", is_correction_threshold=[0, 0.05])
+    loss, _, _, _, filt = loss_fn(logp, logp, torch.ones(1, 2), action_mask=torch.ones(1, 2), rollout_log_probs=mu)
+    torch.testing.assert_close(filt, torch.tensor(0.5))
+    torch.testing.assert_close(loss, torch.tensor(-(0.52 / 0.5) / 2))
+
+
+def test_invalid_is_correction_combinations_are_rejected():
+    for kw in (
+        dict(is_correction_level="seq", is_correction_mode="clip"),
+        dict(is_correction_level="token", is_correction_mode="clip", is_correction_gating="binary_kl"),
+        dict(is_correction_level="token", is_correction_gating="kl"),
+        dict(is_correction_level="geo"),
+    ):
+        with pytest.raises(ValueError):
+            PolicyLoss(is_correction_threshold=[0, 0.05], **kw)
+    with pytest.raises(ValueError, match="upper bound only"):  # the ratio band [0.5, 5] would reject everything
+        PolicyLoss(is_correction_level="seq", is_correction_gating="binary_kl", is_correction_threshold=[0.5, 5.0])
+
+
+def test_seq_mean_token_mean_weighs_every_sequence_the_same():
+    # Two rows of unequal length: loss = -(A0 + A1) / 2, gradient -A_i / (T_i * B) per token.
+    logp = torch.full((2, 2), -0.6931, requires_grad=True)
+    mask = torch.tensor([[1.0, 1.0], [1.0, 0.0]])
+    adv = torch.tensor([[2.0, 2.0], [1.0, 0.0]])
+    loss, *_ = PolicyLoss(token_level_loss=False)(logp, logp.detach(), adv, action_mask=mask)
+    torch.testing.assert_close(loss, torch.tensor(-1.5))
+    loss.backward()
+    torch.testing.assert_close(logp.grad, torch.tensor([[-0.5, -0.5], [-0.5, 0.0]]))

@@ -272,6 +272,10 @@ class RemoteExperienceMaker:
             rewards = rewards - rewards.mean(-1, keepdim=True)
         elif args.algo.advantage.estimator == "group_norm":
             rewards = (rewards - rewards.mean(-1, keepdim=True)) / (rewards.std(-1, keepdim=True) + 1e-9)
+        elif args.algo.advantage.estimator == "flash_reinforce":
+            # FlashREINFORCE: baseline = mean over the whole rollout batch (the single-rollout
+            # regime has no prompt group), no whitening below.
+            rewards = rewards - rewards.mean()
 
         rewards = rewards.reshape(-1)[indices].split(exp_len)
 
@@ -293,14 +297,16 @@ class RemoteExperienceMaker:
                     args.algo.advantage.gamma,
                     args.algo.advantage.lambd,
                 )
-            elif self.advantage_estimator in ["reinforce", "rloo", "reinforce_baseline", "group_norm", "dr_grpo"]:
-                if args.algo.advantage.gamma != 1.0 and self.advantage_estimator in [
-                    "rloo",
-                    "reinforce_baseline",
-                    "group_norm",
-                    "dr_grpo",
-                ]:
-                    logger.warning("gamma is set to 1.0 for rloo, reinforce_baseline, and group_norm")
+            elif self.advantage_estimator in [
+                "reinforce",
+                "rloo",
+                "reinforce_baseline",
+                "group_norm",
+                "dr_grpo",
+                "flash_reinforce",
+            ]:
+                if args.algo.advantage.gamma != 1.0 and self.advantage_estimator != "reinforce":
+                    logger.warning(f"gamma is set to 1.0 for {self.advantage_estimator}")
                     args.algo.advantage.gamma = 1.0
 
                 experience.returns = self.get_cumulative_returns(

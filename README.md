@@ -190,6 +190,7 @@ OpenRLHF implements **PPO, REINFORCE++, REINFORCE++-baseline, GRPO, RLOO** with 
 | **RLOO** | `rloo` | Per-token KL + PPO-clip | Multi-sample training |
 | **GRPO** | `group_norm` | Group normalization | Batch-based training |
 | **Dr. GRPO** | `dr_grpo` | Simplified GRPO | Removes local `/std` norm |
+| **FlashREINFORCE** | `flash_reinforce` | Critic-free single-rollout RL: batch-mean baseline, binary-KL trust region on the vLLM logprobs | Async agentic RL with one rollout per prompt ([script](examples/scripts/train_flash_reinforce_ray_agent_async.sh)) |
 
 </details>
 
@@ -493,15 +494,18 @@ ray job submit --address="http://127.0.0.1:8265" \
 # --algo.advantage.estimator reinforce_baseline  # REINFORCE++-baseline (best for RLVR)
 # --algo.advantage.estimator group_norm       # GRPO
 # --algo.advantage.estimator dr_grpo          # Dr. GRPO
+# --algo.advantage.estimator flash_reinforce  # FlashREINFORCE (single rollout: --rollout.n_samples_per_prompt 1)
 
 # Advanced Options:
 # --algo.kl.init_coef 0                                    # No reference model
 # --reward.remote_url http://host:5000/get_reward         # HTTP reward model
 # --rollout.n_samples_per_prompt 4                            # Multiple samples per prompt
 # --rollout.vllm_generate_batch_size 2048                     # Oversample at generation (> rollout_batch_size); requires --train.async_enable
-# --algo.advantage.is_correction_enable                         # vLLM importance sampling correction for off-policy rollouts
-# --algo.advantage.is_correction_type tis                       # Correction type: tis (token clamp) | icepop (token filter) | seq-mask-tis (seq-level geom mean)
-# --algo.advantage.is_correction_threshold 0.5 5.0               # IS truncation interval: [low, high]
+# --algo.advantage.is_correction_level token                    # vLLM importance sampling correction for off-policy rollouts: token | seq (per-sequence mean)
+# --algo.advantage.is_correction_mode mask                      # Out-of-band treatment: mask (ICEPOP / seq-mask-tis) | clip (TIS, token level only)
+# --algo.advantage.is_correction_gating ratio                   # Gated statistic: ratio (the IS weight) | binary_kl | tv (trust region on the sampled token)
+# --algo.advantage.is_correction_threshold 0.5 5.0              # [low, high] band on the gated statistic; a single value is an upper bound only
+# --actor.loss_agg_mode seq-mean-token-mean                     # Policy-loss aggregation: token-mean (default) | seq-mean-token-mean (every sequence weighs the same)
 # --ckpt.best_metric_key eval_default_pass1                # Save best checkpoint by eval metric (empty = auto-detect first pass1, 'none' = disable)
 # --actor.policy_loss_type gspo                             # Use GSPO policy loss variant (vs default 'ppo')
 ```
@@ -731,7 +735,7 @@ Pick the execution mode based on your priority — OpenRLHF gives you a clear tr
 |------|-------|-----------------|-------------|
 | **Hybrid Engine (colocated)** | `--train.colocate_all`<br>`--vllm.enable_sleep`<br>`--ds.enable_sleep` | **Most stable** — strictly on-policy, every rollout uses the latest weights. Serial generate→train cycle. | Research, sensitive RL algorithms, reproducibility, recipe validation |
 | **Async Training** | `--train.async_enable`<br>`--train.async_queue_size N` | **Highest throughput** — generation and training run in parallel. Tune off-policyness via `--train.async_queue_size` (larger = more off-policy). | Production throughput when convergence is already validated |
-| **Async + Partial Rollout** | `--train.async_enable`<br>`--train.partial_rollout_enable` | **Maximum overlap** — vLLM pause/resume instead of locking, in-flight samples may mix old/new weights. Most aggressive off-policy. | Pushing async throughput further; pair with `--algo.advantage.is_correction_enable` |
+| **Async + Partial Rollout** | `--train.async_enable`<br>`--train.partial_rollout_enable` | **Maximum overlap** — vLLM pause/resume instead of locking, in-flight samples may mix old/new weights. Most aggressive off-policy. | Pushing async throughput further; pair with `--algo.advantage.is_correction_level token` |
 
 #### ⚡ Other Speed Optimizations
 

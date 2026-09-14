@@ -43,7 +43,8 @@ python3 -m openrlhf.cli.train_ppo_ray \
    --vllm.enforce_eager \
    --vllm.enable_sleep \
    --ds.enable_sleep \
-   --algo.advantage.is_correction_enable
+   --algo.advantage.is_correction_level token \
+   --algo.advantage.is_correction_mode clip
 
 # You could also try
 #   --algo.kl.estimator k2 \

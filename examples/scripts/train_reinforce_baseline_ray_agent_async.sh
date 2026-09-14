@@ -90,8 +90,8 @@ OPTIMIZER_ARGS=(
    --algo.kl.init_coef 1e-5
    --algo.kl.use_loss
    --algo.kl.estimator k2
-   --algo.advantage.is_correction_enable
-   --algo.advantage.is_correction_type icepop
+   --algo.advantage.is_correction_level token
+   --algo.advantage.is_correction_mode mask
 )
 
 LOG_ARGS=(

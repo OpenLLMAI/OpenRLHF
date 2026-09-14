@@ -188,6 +188,7 @@ OpenRLHF 实现了 **PPO、REINFORCE++、REINFORCE++-baseline、GRPO、RLOO**，
 | **RLOO** | `rloo` | Per-token KL + PPO-clip | 多样本训练 |
 | **GRPO** | `group_norm` | 组归一化 | 基于批次的训练 |
 | **Dr. GRPO** | `dr_grpo` | 简化的 GRPO | 移除局部 `/std` 归一化 |
+| **FlashREINFORCE** | `flash_reinforce` | 无 critic 的单 rollout RL：batch 均值基线 + 基于 vLLM logprob 的 binary-KL 信任域 | 每个 prompt 只采 1 条的异步 agentic RL（[脚本](examples/scripts/train_flash_reinforce_ray_agent_async.sh)） |
 
 </details>
 
@@ -490,15 +491,17 @@ ray job submit --address="http://127.0.0.1:8265" \
 # --algo.advantage.estimator reinforce_baseline  # REINFORCE++-baseline（RLVR 最佳）
 # --algo.advantage.estimator group_norm       # GRPO
 # --algo.advantage.estimator dr_grpo          # Dr. GRPO
+# --algo.advantage.estimator flash_reinforce  # FlashREINFORCE（单 rollout：--rollout.n_samples_per_prompt 1）
 
 # 高级选项：
 # --algo.kl.init_coef 0                                    # 无参考模型
 # --reward.remote_url http://host:5000/get_reward         # HTTP 奖励模型
 # --rollout.n_samples_per_prompt 4                            # 每个提示多个样本
 # --rollout.vllm_generate_batch_size 2048                     # 生成阶段过采样（> rollout_batch_size）；需要配合 --train.async_enable
-# --algo.advantage.is_correction_enable                         # vLLM 重要性采样修正，用于 off-policy rollout
-# --algo.advantage.is_correction_type tis                       # 修正类型：tis（token clamp）| icepop（token 过滤）| seq-mask-tis（序列级几何平均）
-# --algo.advantage.is_correction_threshold 0.5 5.0               # IS 截断区间：[low, high]
+# --algo.advantage.is_correction_level token                    # vLLM 重要性采样修正，用于 off-policy rollout：token | seq（序列级均值）
+# --algo.advantage.is_correction_mode mask                      # 越界处理：mask（ICEPOP / seq-mask-tis）| clip（TIS，仅 token 级）
+# --algo.advantage.is_correction_gating ratio                   # 门控统计量：ratio（IS 权重）| binary_kl | tv（采样 token 上的信任域）
+# --algo.advantage.is_correction_threshold 0.5 5.0              # 门控统计量的 [low, high] 区间；只给一个值表示仅上界
 # --ckpt.best_metric_key eval_default_pass1                # 按评估指标保存最佳检查点（留空自动探测首个 pass1，'none' 禁用）
 # --actor.policy_loss_type gspo                             # 使用 GSPO 策略损失变体（默认为 'ppo'）
 ```
@@ -713,7 +716,7 @@ python -m openrlhf.cli.lora_combiner \
 |------|---------|------|---------|
 | **混合引擎（colocated）** | `--train.colocate_all`<br>`--vllm.enable_sleep`<br>`--ds.enable_sleep` | **最稳定** ——严格 on-policy，每次 rollout 使用最新权重，生成→训练串行执行 | 研究、对 off-policy 敏感的 RL 算法、复现、配方验证 |
 | **异步训练** | `--train.async_enable`<br>`--train.async_queue_size N` | **最快** ——生成与训练并行执行，通过 `--train.async_queue_size` 调控异步程度（越大越 off-policy） | 收敛已验证后的生产吞吐场景 |
-| **异步 + 部分 rollout** | `--train.async_enable`<br>`--train.partial_rollout_enable` | **最大化重叠** ——使用 vLLM pause/resume 替代加锁，in-flight 样本可能混合新旧权重；异步程度最激进 | 进一步压榨异步吞吐；建议搭配 `--algo.advantage.is_correction_enable` |
+| **异步 + 部分 rollout** | `--train.async_enable`<br>`--train.partial_rollout_enable` | **最大化重叠** ——使用 vLLM pause/resume 替代加锁，in-flight 样本可能混合新旧权重；异步程度最激进 | 进一步压榨异步吞吐；建议搭配 `--algo.advantage.is_correction_level token` |
 
 #### ⚡ 其他速度优化
 

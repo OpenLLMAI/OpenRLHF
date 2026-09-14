@@ -125,9 +125,10 @@ class PolicyLoss(nn.Module):
         dual_clip: float = None,
         token_level_loss: bool = True,
         policy_loss_type: str = "ppo",
-        enable_vllm_is_correction: bool = False,
-        vllm_is_truncated_threshold: list = None,
-        vllm_is_correction_type: str = "tis",
+        is_correction_level: str = "off",
+        is_correction_mode: str = "mask",
+        is_correction_gating: str = "ratio",
+        is_correction_threshold: list = (0.5, 5.0),
     ) -> None:
         super().__init__()
         self.clip_eps_low = clip_eps_low
@@ -135,9 +136,16 @@ class PolicyLoss(nn.Module):
         self.token_level_loss = token_level_loss
         self.dual_clip = dual_clip
         self.policy_loss_type = policy_loss_type
-        self.enable_vllm_is_correction = enable_vllm_is_correction
-        self.vllm_is_truncated_threshold = vllm_is_truncated_threshold
-        self.vllm_is_correction_type = vllm_is_correction_type
+        # Train/rollout (DeepSpeed-actor vs vLLM) logprob-mismatch correction on the per-token
+        # IS ratio pi_train/pi_rollout. A gate reads a statistic per unit (level: token, or the
+        # per-sequence mean) and drops (mask) or clamps (clip) units outside [low, high].
+        # gating selects the statistic: the ratio itself (TIS / ICEPOP / seq-mask-tis) or the
+        # sampled-token binary_kl / tv divergence between rollout and train policy (a trust
+        # region; FlashREINFORCE gates the per-sequence mean binary KL).
+        self.is_correction_level = is_correction_level
+        self.is_correction_mode = is_correction_mode
+        self.is_correction_gating = is_correction_gating
+        self.is_correction_threshold = is_correction_threshold
 
         # GSPO requires sequence-level loss (per-sample mean)
         if policy_loss_type == "gspo":
@@ -147,10 +155,21 @@ class PolicyLoss(nn.Module):
         if dual_clip is not None:
             assert dual_clip > 1.0, f"dual_clip must be > 1.0, got {dual_clip}"
 
-        if self.vllm_is_correction_type not in {"tis", "icepop", "seq-mask-tis"}:
+        if is_correction_level not in {"off", "token", "seq"}:
+            raise ValueError(f"is_correction_level must be off/token/seq, got {is_correction_level}")
+        if is_correction_mode not in {"mask", "clip"}:
+            raise ValueError(f"is_correction_mode must be mask/clip, got {is_correction_mode}")
+        if is_correction_gating not in {"ratio", "binary_kl", "tv"}:
+            raise ValueError(f"is_correction_gating must be ratio/binary_kl/tv, got {is_correction_gating}")
+        # Only the per-token ratio is a weight that can be clamped; a per-sequence statistic or a
+        # divergence is a rejection filter.
+        if is_correction_mode == "clip" and (is_correction_level == "seq" or is_correction_gating != "ratio"):
             raise ValueError(
-                f"Invalid vllm_is_correction_type: {self.vllm_is_correction_type}, must be one of tis/icepop/seq-mask-tis"
+                "is_correction_mode=clip requires is_correction_level=token and is_correction_gating=ratio"
             )
+        # A divergence is bounded from above only; the default ratio band [0.5, 5] would reject everything.
+        if is_correction_gating != "ratio" and is_correction_level != "off" and is_correction_threshold[0] > 0:
+            raise ValueError(f"is_correction_gating={is_correction_gating} takes an upper bound only (a single delta)")
 
     def forward(
         self,
@@ -169,7 +188,7 @@ class PolicyLoss(nn.Module):
             ratio = policy_log_ratio.exp()
         elif self.policy_loss_type == "gspo":
             # GSPO: https://arxiv.org/pdf/2507.18071
-            if self.enable_vllm_is_correction:
+            if self.is_correction_level != "off":
                 log_ratio = log_probs - rollout_log_probs
             else:
                 log_ratio = raw_policy_log_ratio
@@ -193,28 +212,38 @@ class PolicyLoss(nn.Module):
             loss = -torch.where(advantages < 0, clip2, clip1)
 
         # Your Efficient RL Framework Secretly Brings You Off-Policy RL Training: https://fengyao.notion.site/off-policy-rl
-        vllm_kl = None
-        if self.enable_vllm_is_correction and self.policy_loss_type == "ppo":
-            low_threshold, high_threshold = self.vllm_is_truncated_threshold
-            rollout_log_ratio = old_log_probs - rollout_log_probs
-            if self.vllm_is_correction_type == "icepop":
-                # ICEPOP: token-level filtering (set coefficients outside the interval to 0)
-                vllm_is = torch.exp(rollout_log_ratio).detach()
-                mask = (vllm_is >= low_threshold) & (vllm_is <= high_threshold)
-                vllm_is = torch.where(mask, vllm_is, 0.0)
-                loss = vllm_is * loss
-            elif self.vllm_is_correction_type == "seq-mask-tis":
-                # seq-mask-tis: use sequence-level geometric mean only for filtering,
-                # correction coefficients still use TIS (token-level clamp)
-                seq_log_ratio = masked_mean(rollout_log_ratio, action_mask, dim=-1)
-                seq_is = torch.exp(seq_log_ratio)
-                seq_mask = (seq_is >= low_threshold) & (seq_is <= high_threshold)
-                vllm_is = torch.exp(rollout_log_ratio).detach()
-                loss = seq_mask.unsqueeze(-1) * vllm_is * loss
+        vllm_kl = is_filter_ratio = None
+        if self.is_correction_level != "off" and self.policy_loss_type == "ppo":
+            low, high = self.is_correction_threshold
+            seq_level = self.is_correction_level == "seq"
+            is_log_ratio = (old_log_probs - rollout_log_probs).detach()  # log(pi_train / pi_rollout)
+            token_is = is_log_ratio.exp()
+            # Gated statistic per unit: at seq level the ratio's geometric mean, a divergence's plain mean.
+            if self.is_correction_gating == "ratio":
+                stat = masked_mean(is_log_ratio, action_mask, dim=-1).unsqueeze(-1) if seq_level else is_log_ratio
+                stat = stat.exp()
             else:
-                # TIS: token-level clamp with low and high thresholds
-                vllm_is = torch.exp(rollout_log_ratio).clamp(min=low_threshold, max=high_threshold).detach()
-                loss = vllm_is * loss
+                p = rollout_log_probs.exp().clamp(1e-6, 1 - 1e-6)  # clamp keeps the binary-KL logs finite
+                q = old_log_probs.exp().clamp(1e-6, 1 - 1e-6)
+                if self.is_correction_gating == "binary_kl":
+                    stat = p * (p / q).log() + (1 - p) * ((1 - p) / (1 - q)).log()
+                else:  # tv
+                    stat = (p - q).abs()
+                if seq_level:
+                    stat = masked_mean(stat, action_mask, dim=-1).unsqueeze(-1)
+            if self.is_correction_mode == "clip":
+                coef = stat.clamp(min=low, max=high)
+                filtered = (stat < low) | (stat > high)
+            else:  # mask: drop out-of-band units, survivors keep their per-token IS weight
+                keep = (stat >= low) & (stat <= high)
+                coef = torch.where(keep, token_is, 0.0)
+                filtered = ~keep
+            loss = coef * loss
+            # Filter fraction at the unit's own granularity: per token, or per sequence.
+            if seq_level:
+                is_filter_ratio = filtered.float().mean()
+            else:
+                is_filter_ratio = masked_mean(filtered.float(), action_mask, dim=None)
             vllm_kl = masked_mean(rollout_log_probs - old_log_probs, action_mask, dim=None)
 
         loss = aggregate_loss(
@@ -227,7 +256,7 @@ class PolicyLoss(nn.Module):
         )
         clip_ratio = masked_mean(torch.lt(surr2, surr1).float(), action_mask, dim=None)
         ppo_kl = masked_mean(-raw_policy_log_ratio.detach(), action_mask, dim=None)
-        return loss, clip_ratio, ppo_kl, vllm_kl
+        return loss, clip_ratio, ppo_kl, vllm_kl, is_filter_ratio
 
 
 class ValueLoss(nn.Module):
