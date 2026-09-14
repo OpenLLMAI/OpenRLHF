@@ -53,6 +53,7 @@ OpenRLHFは、**Ray + vLLM分散アーキテクチャ**と**統一エージェ�
 <details>
 <summary>ニュースを表示</summary>
 
+- [2026/9] OpenRLHF が [FlashREINFORCE](https://www.researchgate.net/publication/414274571_FlashREINFORCE_FLASHREINFORCE_CRITIC-FREE_SINGLE-ROLLOUT_ASYNCHRONOUS_RL_FOR_AGENTIC_LANGUAGE_MODELS) をサポート — エージェント LLM 向けの critic なし・単一ロールアウト非同期 RL。設定の組み合わせだけで実現（`--algo.advantage.estimator flash_reinforce`、vLLM logprob に対する binary-KL 信頼領域、サンプル平均集約）。学習スクリプト：[train_flash_reinforce_ray_agent_async.sh](./examples/scripts/train_flash_reinforce_ray_agent_async.sh)
 - [2026/2] [ProRL V2](https://developer.nvidia.com/blog/scaling-llm-reinforcement-learning-with-prolonged-training-using-prorl-v2/) がREINFORCE++-baselineを使用して長期RL学習で最先端の1.5B推論モデルを学習。学習スクリプト：[train_prorlv2_math_hybrid_engine.sh](./examples/scripts/train_prorlv2_math_hybrid_engine.sh)
 - [2025/10] [ScaleRL](https://arxiv.org/abs/2510.13786) が大規模学習シナリオにおけるREINFORCE++-baselineの有効性を検証。[REINFORCE++スライド](https://docs.google.com/presentation/d/1stieP_3PM1z4Hq1YWR3GywFkxcHEAlstXMaS23KlGN4)をリリース
 - [2025/6] [Magistral](https://mistral.ai/static/research/magistral.pdf) がREINFORCE++-baselineと非常に類似した手法を用いて推論モデルを学習。
@@ -186,6 +187,7 @@ OpenRLHFは、実践ガイドとコミュニティのベストプラクティス
 | **RLOO** | `rloo` | トークンごとのKL + PPO-clip | マルチサンプル学習 |
 | **GRPO** | `group_norm` | グループ正規化 | バッチベースの学習 |
 | **Dr. GRPO** | `dr_grpo` | 簡略化されたGRPO | ローカル`/std`正規化の削除 |
+| **FlashREINFORCE** | `flash_reinforce` | critic なしの単一ロールアウト RL：バッチ平均ベースライン + vLLM logprob に対する binary-KL 信頼領域 | プロンプトごとに 1 ロールアウトの非同期エージェント RL（[スクリプト](examples/scripts/train_flash_reinforce_ray_agent_async.sh)） |
 
 </details>
 

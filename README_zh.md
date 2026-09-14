@@ -53,6 +53,7 @@ OpenRLHF 是**首个**结合 **Ray + vLLM 分布式架构**与**统一 Agent 设
 <details>
 <summary>展开新闻</summary>
 
+- [2026/9] OpenRLHF 支持 [FlashREINFORCE](https://www.researchgate.net/publication/414274571_FlashREINFORCE_FLASHREINFORCE_CRITIC-FREE_SINGLE-ROLLOUT_ASYNCHRONOUS_RL_FOR_AGENTIC_LANGUAGE_MODELS) — 面向 agentic 语言模型的无 critic、单 rollout 异步 RL，仅由配置组合实现（`--algo.advantage.estimator flash_reinforce`、基于 vLLM logprob 的 binary-KL 信任域、样本均值聚合）。训练脚本：[train_flash_reinforce_ray_agent_async.sh](./examples/scripts/train_flash_reinforce_ray_agent_async.sh)
 - [2026/4] OpenRLHF 0.10 新增 **多轮 VLM RL** — 支持 prompt 和环境反馈（如截图）中均包含图像的多步交互。示例：[vlm_multiturn_agent.py](./examples/python/vlm_multiturn_agent.py)
 - [2026/4] OpenRLHF 0.10 新增 **VLM（视觉语言模型）RLHF 支持** — 支持 Qwen3.5 等 VLM 的端到端图像输入训练。训练脚本：[train_vlm_math_hybrid_engine.sh](./examples/scripts/train_vlm_math_hybrid_engine.sh)
 - [2026/2] [ProRL V2](https://developer.nvidia.com/blog/scaling-llm-reinforcement-learning-with-prolonged-training-using-prorl-v2/) 使用 REINFORCE++-baseline 通过长期 RL 训练训练最先进的 1.5B 推理模型。训练脚本：[train_prorlv2_math_hybrid_engine.sh](./examples/scripts/train_prorlv2_math_hybrid_engine.sh)
