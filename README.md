@@ -55,6 +55,7 @@ OpenRLHF is **the first** high-performance, production-ready open-source RLHF fr
 <details>
 <summary>Show News</summary>
 
+- [2026/9] OpenRLHF supports [FlashREINFORCE](https://www.researchgate.net/publication/414274571_FlashREINFORCE_FLASHREINFORCE_CRITIC-FREE_SINGLE-ROLLOUT_ASYNCHRONOUS_RL_FOR_AGENTIC_LANGUAGE_MODELS) — critic-free, single-rollout asynchronous RL for agentic language models, as a composition of configs (`--algo.advantage.estimator flash_reinforce`, a binary-KL trust region on the vLLM logprobs, sample-mean aggregation). Training script: [train_flash_reinforce_ray_agent_async.sh](./examples/scripts/train_flash_reinforce_ray_agent_async.sh)
 - [2026/4] OpenRLHF 0.10 adds **Multi-Turn VLM RL** — multi-step interactions with images in both prompts and environment feedback (e.g. screenshots). Example: [vlm_multiturn_agent.py](./examples/python/vlm_multiturn_agent.py)
 - [2026/4] OpenRLHF 0.10 adds **VLM (Vision-Language Model) RLHF support** — train VLMs like Qwen3.5 with image inputs end-to-end. Training script: [train_vlm_math_hybrid_engine.sh](./examples/scripts/train_vlm_math_hybrid_engine.sh)
 - [2026/2] [ProRL V2](https://developer.nvidia.com/blog/scaling-llm-reinforcement-learning-with-prolonged-training-using-prorl-v2/) uses REINFORCE++-baseline to train a state-of-the-art 1.5B reasoning model with prolonged RL training. Training script: [train_prorlv2_math_hybrid_engine.sh](./examples/scripts/train_prorlv2_math_hybrid_engine.sh)
